@@ -50,6 +50,7 @@ void writeNodeAt(fstream &f, int nodeIndex, const Node &n, int m) {
         f.write(reinterpret_cast<const char*>(&n.keys[i]), INT_BYTES);
         f.write(reinterpret_cast<const char*>(&n.refs[i]), INT_BYTES);
     }
+    f.flush();
 }
 
 Node readNodeAt(fstream &f, int nodeIndex, int m) {
@@ -150,6 +151,209 @@ int allocateNode(fstream &f, int m) {
     writeNodeAt(f, freeIdx, newNode, m);
     return freeIdx;
 }
+
+void freeNode(fstream &f, int idx, int m) {
+    // 1. Read the Head of the Free List (Node 0)
+    Node head = readNodeAt(f, 0, m);
+
+    // 2. Create a "clean" node to overwrite the data at idx
+    Node freedNode(m);
+    freedNode.flag = -1; // Mark as free/empty
+
+    // 3. Link this node into the free list
+    // The new free node points to whatever Node 0 currently points to
+    freedNode.refs[0] = head.refs[0];
+
+    // 4. Update Node 0 to point to this newly freed node
+    head.refs[0] = idx;
+
+    // 5. Write changes to disk
+    writeNodeAt(f, idx, freedNode, m);
+    writeNodeAt(f, 0, head, m);
+}
+
+void handleUnderflow(fstream &f, int currIdx, vector<int>& path, int m) {
+    Node curr = readNodeAt(f, currIdx, m);
+    int minKeys = m / 2; // e.g., 5/2 = 2
+
+    // 1. ROOT CHECK
+    // If we reached the root (Node 1)
+    if (currIdx == 1) {
+        // If root is internal and has only 1 child, that child becomes the new root content
+        if (curr.flag == 1 && countKeys(curr) == 1) {
+            int childIdx = curr.refs[0];
+            Node child = readNodeAt(f, childIdx, m);
+
+            // Move child content to Node 1
+            writeNodeAt(f, 1, child, m);
+
+            // Free the old child node
+            freeNode(f, childIdx, m);
+        }
+        // If root is leaf, it can have 0 keys (empty file), no underflow fix needed
+        return;
+    }
+
+    // If node has enough keys, stop
+    if (countKeys(curr) >= minKeys) return;
+
+    // 2. GET PARENT & SIBLINGS
+    int parentIdx = path.back();
+    Node parent = readNodeAt(f, parentIdx, m);
+
+    // Find our position in parent
+    int ptrIndex = -1;
+    for (int i = 0; i < m; i++) {
+        if (parent.refs[i] == currIdx) { ptrIndex = i; break; }
+    }
+
+    int leftSiblingIdx = -1;
+    int rightSiblingIdx = -1;
+    if (ptrIndex > 0) leftSiblingIdx = parent.refs[ptrIndex - 1];
+    // Find next valid ref for right sibling
+    if (ptrIndex < m - 1) rightSiblingIdx = parent.refs[ptrIndex + 1];
+
+    // 3. TRY BORROW FROM LEFT
+    if (leftSiblingIdx != -1) {
+        Node left = readNodeAt(f, leftSiblingIdx, m);
+        if (countKeys(left) > minKeys) {
+            // Take largest from left
+            int maxK = -1, maxR = -1;
+            // Find max (last valid item)
+            int lastPos = -1;
+            for(int k=m-1; k>=0; k--) if(left.keys[k] != -1) {
+                maxK=left.keys[k]; maxR=left.refs[k]; lastPos=k; break;
+            }
+
+            // Remove from Left
+            left.keys[lastPos] = -1; left.refs[lastPos] = -1;
+            // Add to Curr (and sort)
+            // Find empty slot
+            for(int k=0; k<m; k++) if(curr.keys[k]==-1) { curr.keys[k]=maxK; curr.refs[k]=maxR; break; }
+            sortNodeContent(curr, m);
+
+            // Update Disk
+            writeNodeAt(f, leftSiblingIdx, left, m);
+            writeNodeAt(f, currIdx, curr, m);
+
+            // Update Parent Keys (Left Max changed, Curr Max might change)
+            updateParentMax(f, parentIdx, leftSiblingIdx, getMaxKey(left), m);
+            updateParentMax(f, parentIdx, currIdx, getMaxKey(curr), m);
+            return;
+        }
+    }
+
+    // 4. TRY BORROW FROM RIGHT
+    if (rightSiblingIdx != -1) {
+        Node right = readNodeAt(f, rightSiblingIdx, m);
+        if (countKeys(right) > minKeys) {
+            // Take smallest from right
+            int minK = right.keys[0];
+            int minR = right.refs[0];
+
+            // Remove from Right (Shift remaining)
+            right.keys[0] = -1; right.refs[0] = -1;
+            sortNodeContent(right, m); // Shifts everything left
+
+            // Add to Curr
+            for(int k=0; k<m; k++) if(curr.keys[k]==-1) { curr.keys[k]=minK; curr.refs[k]=minR; break; }
+            sortNodeContent(curr, m);
+
+            // Update Disk
+            writeNodeAt(f, rightSiblingIdx, right, m);
+            writeNodeAt(f, currIdx, curr, m);
+
+            // Update Parent Keys
+            updateParentMax(f, parentIdx, rightSiblingIdx, getMaxKey(right), m);
+            updateParentMax(f, parentIdx, currIdx, getMaxKey(curr), m);
+            return;
+        }
+    }
+
+    // 5. MERGE WITH LEFT (if borrow failed)
+    if (leftSiblingIdx != -1) {
+        Node left = readNodeAt(f, leftSiblingIdx, m);
+
+        // Move all items from Curr to Left
+        for(int i=0; i<m; i++) {
+            if(curr.keys[i] != -1) {
+                // Find space in Left
+                for(int j=0; j<m; j++) {
+                    if(left.keys[j] == -1) {
+                        left.keys[j] = curr.keys[i];
+                        left.refs[j] = curr.refs[i];
+                        break;
+                    }
+                }
+            }
+        }
+        sortNodeContent(left, m);
+        writeNodeAt(f, leftSiblingIdx, left, m);
+
+        // Free Curr
+        freeNode(f, currIdx, m);
+
+        // Remove Curr from Parent
+        parent.keys[ptrIndex] = -1;
+        parent.refs[ptrIndex] = -1;
+        sortNodeContent(parent, m); // Shifts to fill gap
+        writeNodeAt(f, parentIdx, parent, m);
+
+        // Update Parent Key for Left (it grew)
+        updateParentMax(f, parentIdx, leftSiblingIdx, getMaxKey(left), m);
+
+        // RECURSE: Parent might now have too few keys
+        path.pop_back(); // Remove parent from path (we are about to pass path to recursive call)
+        handleUnderflow(f, parentIdx, path, m);
+        return;
+    }
+
+    // 6. MERGE WITH RIGHT
+    if (rightSiblingIdx != -1) {
+        Node right = readNodeAt(f, rightSiblingIdx, m);
+
+        // Move all items from Right to Curr
+        for(int i=0; i<m; i++) {
+            if(right.keys[i] != -1) {
+                for(int j=0; j<m; j++) {
+                    if(curr.keys[j] == -1) {
+                        curr.keys[j] = right.keys[i];
+                        curr.refs[j] = right.refs[i];
+                        break;
+                    }
+                }
+            }
+        }
+        sortNodeContent(curr, m);
+        writeNodeAt(f, currIdx, curr, m);
+
+        // Free Right
+        freeNode(f, rightSiblingIdx, m);
+
+        // Remove Right from Parent
+        // Right was at ptrIndex + 1
+        // But wait, we need to find exactly where it is now (sorting might have shifted if previous deletes happened? No, we just read it)
+        int rightPtrPos = -1;
+        for(int i=0; i<m; i++) if(parent.refs[i] == rightSiblingIdx) rightPtrPos = i;
+
+        if(rightPtrPos != -1) {
+            parent.keys[rightPtrPos] = -1;
+            parent.refs[rightPtrPos] = -1;
+            sortNodeContent(parent, m);
+            writeNodeAt(f, parentIdx, parent, m);
+        }
+
+        // Update Parent Key for Curr (it grew)
+        updateParentMax(f, parentIdx, currIdx, getMaxKey(curr), m);
+
+        path.pop_back();
+        handleUnderflow(f, parentIdx, path, m);
+        return;
+    }
+}
+
+//--------------------- OPRATIONS ----------------------
+
 int InsertNewRecordAtIndex(char* filename, int RecordID, int Reference) {
     fstream f(filename, ios::in | ios::out | ios::binary);
     if (!f.is_open()) return -1;
@@ -400,6 +604,7 @@ void DeleteRecordFromIndex(char* filename, int RecordID) {
     Node cur = readNodeAt(f, curIdx, m);
     if (cur.flag == -1) { f.close(); return; }
 
+    // 1. SEARCH
     while (cur.flag != 0) {
         path.push_back(curIdx);
         int nextIdx = -1;
@@ -409,33 +614,61 @@ void DeleteRecordFromIndex(char* filename, int RecordID) {
                 break;
             }
         }
-        if (nextIdx == -1) {
-             for(int i=m-1; i>=0; i--) if(cur.refs[i]!=-1) { nextIdx=cur.refs[i]; break; }
-        }
+        if (nextIdx == -1) { for(int i=m-1; i>=0; i--) if(cur.refs[i]!=-1) { nextIdx=cur.refs[i]; break; } }
         if (nextIdx == -1) { f.close(); return; }
         curIdx = nextIdx;
         cur = readNodeAt(f, curIdx, m);
     }
 
+    // 2. DELETE FROM LEAF
     bool found = false;
     for (int i = 0; i < m; i++) {
         if (cur.keys[i] == RecordID) {
-            cur.keys[i] = -1;
-            cur.refs[i] = -1;
-            found = true;
-            break;
+            cur.keys[i] = -1; cur.refs[i] = -1;
+            found = true; break;
         }
     }
-    if (!found) { f.close(); return; }
+    if (!found) { cout << "Record " << RecordID << " not found.\n"; f.close(); return; }
 
     sortNodeContent(cur, m);
-    writeNodeAt(f, curIdx, cur, m);
+    writeNodeAt(f, curIdx, cur, m); // This now FLUSHES, so the next read sees the change
 
+    // 3. PROPAGATE UPDATE UPWARDS
     if (!path.empty()) {
-        int newMax = getMaxKey(cur);
-        updateParentMax(f, path.back(), curIdx, newMax, m);
+        for(int i = (int)path.size()-1; i >= 0; i--) {
+            int child = (i == (int)path.size()-1) ? curIdx : path[i+1];
+            int parent = path[i];
+
+            Node p = readNodeAt(f, parent, m);
+            Node c = readNodeAt(f, child, m); // Now reads the UPDATED child correctly
+            int cMax = getMaxKey(c); // Calculates new max (e.g., 9 instead of 10)
+
+            bool updated = false;
+            for(int k=0; k<m; k++) {
+                if(p.refs[k] == child) {
+                    if(p.keys[k] != cMax) {
+                        p.keys[k] = cMax;
+                        updated = true;
+                    }
+                }
+            }
+            if(updated) {
+                sortNodeContent(p, m);
+                writeNodeAt(f, parent, p, m); // Flushes this parent too
+            } else {
+                break;
+            }
+        }
     }
+
+    // 4. CHECK UNDERFLOW
+    int minKeys = m / 2;
+    if (countKeys(cur) < minKeys) {
+        handleUnderflow(f, curIdx, path, m);
+    }
+
     f.close();
+    cout << "Record " << RecordID << " deleted successfully.\n";
 }
 
 int SearchARecord(char* filename, int RecordID) {
@@ -485,14 +718,18 @@ void DisplayIndexFileContent(char* filename) {
 
     for (int i = 0; i < count; i++) {
         Node n = readNodeAt(f, i, m);
-        cout << "Node " << i << ": [" << n.flag << "]";
+        cout << "N " << i << ": {" << n.flag << "}";
         for(int j=0; j<m; j++) {
-            cout << " (" << n.keys[j] << "," << n.refs[j] << ")";
+            cout << " [" << n.keys[j] << "," << n.refs[j] << "]";
         }
+        cout << "\n";
+        cout << "-------------------------------------------------------";
         cout << "\n";
     }
     f.close();
 }
+
+//----------------------MAIN---------------------------
 
 int main() {
     char filename[] = "btree_index_final.idx";
@@ -568,6 +805,26 @@ int main() {
             InsertNewRecordAtIndex(filename, 17, 216);
             InsertNewRecordAtIndex(filename, 18, 228);
             DisplayIndexFileContent(filename);
+
+            cout << "\n--- Inserting rest (Page 5) ---\n";
+            InsertNewRecordAtIndex(filename, 32, 240);
+            DisplayIndexFileContent(filename);
+
+
+
+
+            cout << "\n--- delete 10 ---\n";
+            DeleteRecordFromIndex(filename,10);
+            DisplayIndexFileContent(filename);
+
+
+            cout << "\n--- delete 9 ---\n";
+            DeleteRecordFromIndex(filename,9);
+            DisplayIndexFileContent(filename);
+
+            cout << "\n--- delete 8 ---\n";
+            DeleteRecordFromIndex(filename,8);
+            DisplayIndexFileContent(filename);
         }
         else if (choice == 6) {
             break;
@@ -579,4 +836,3 @@ int main() {
 
     return 0;
 }
-
